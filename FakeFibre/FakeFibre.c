@@ -1,0 +1,278 @@
+
+/*
+ * An ugly, ugly ugly implementation of fibres using pthreads.
+ * Im after windows SwitchToFibre functioality, but existing
+ * libraries dont quite fulfill my need because...
+ *
+ * ucontext - deprecated and not mandatory ( not implemented on Android ).
+ * libtask - cant yield to a specific task.
+ * libconcurrency - would be perfect.... except it reallocates / moves stacks... cant take the address of stack variables! I need this. )
+ **/
+
+#include "FakeFibre.h"
+
+#include<pthread.h>
+#include<stdlib.h>
+
+/*** TLS ***/
+static pthread_key_t master_key;
+static pthread_once_t master_key_once = PTHREAD_ONCE_INIT;
+static void make_master_key() {
+    pthread_key_create(&master_key, NULL);
+}
+/***********/
+
+struct master_thread_struct;
+typedef struct master_thread_struct master_thread_t;
+
+struct _fake_fibre {
+
+	master_thread_t * master;
+
+	pthread_t thread;
+
+	ff_function start_routine;
+	void *data;
+
+	ff_handle exit_to;
+};
+
+struct master_thread_struct {
+
+	int ref;
+	ff_handle running;
+	ff_handle next;
+
+	pthread_mutex_t mutex;
+	pthread_cond_t  condition;
+};
+
+static int _create_master_struct(master_thread_t ** master) {
+
+	master_thread_t * m = NULL;
+
+	pthread_once(&master_key_once, make_master_key);
+
+	m = calloc(1, sizeof(struct master_thread_struct) );
+
+	m->ref = 1;
+	pthread_mutex_init(&m->mutex , NULL);
+	pthread_cond_init(&m->condition, NULL);
+
+	pthread_setspecific(master_key, m);
+
+	if(master)
+		*master = m;
+	return 0;
+}
+
+static int _free_master_struct(master_thread_t * master) {
+
+	if(!master)
+		return 0;
+
+	master->ref--;
+	if(master->ref>0)
+		return;
+
+	pthread_setspecific(master_key, NULL);
+
+	pthread_cond_destroy(&master->condition);
+	pthread_mutex_destroy(&master->mutex);
+	free(master);
+	return 0;
+}
+
+static int _create_ff_struct(ff_handle * f) {
+
+	ff_handle h = calloc(1, sizeof(struct _fake_fibre));
+	if(!h)
+		return -1;
+
+	*f = h;
+	return 0;
+}
+
+static int _free_ff_struct(ff_handle f) {
+
+	free(f);
+	return 0;
+}
+
+static void _wait_for_runnable(ff_handle h) {
+
+	for(;;) {
+
+		pthread_cond_wait( &h->master->condition, &h->master->mutex );
+
+		if(h->master->next && ( h->master->next != h) )
+			pthread_mutex_unlock(&h->master->mutex);
+		else
+			break;
+	}
+
+	h->master->running = h;
+	h->master->next = h;
+}
+
+static void * _new_fake_fibre(void* data) {
+
+	void * ret = NULL;
+
+	ff_handle h = (ff_handle)data;
+
+	pthread_detach( pthread_self() );
+
+	pthread_setspecific(master_key, h->master);
+
+	_wait_for_runnable(h);
+
+	ret = (*h->start_routine)(h->data);
+
+	ff_exit();
+
+	return ret;
+}
+
+int ff_convert_this(ff_handle * f) {
+
+	master_thread_t * m = NULL;
+
+	pthread_once(&master_key_once, make_master_key);
+
+	m = (master_thread_t *)pthread_getspecific(master_key);
+
+	if(m) {
+		*f = m->running;
+		return 0;
+	}
+
+	if( _create_ff_struct(f) == 0) {
+
+		(*f)->thread = pthread_self();
+
+		_create_master_struct(&(*f)->master);
+
+		(*f)->master->running = *f;
+		(*f)->master->next = *f;
+
+		pthread_mutex_lock(&(*f)->master->mutex);
+
+		return 0;
+	}
+}
+
+int ff_create(ff_handle * _f, ff_function start_routine, void * data, ff_handle exit_to) {
+
+	if( _create_ff_struct(_f) == 0) {
+
+		ff_handle f = *_f;
+
+		f->start_routine = start_routine;
+		f->data = data;
+		f->exit_to = exit_to;
+		f->master = (master_thread_t*)pthread_getspecific(master_key);
+		f->master->ref++;
+
+		pthread_create( &f->thread, NULL, &_new_fake_fibre, f );
+
+		return 0;
+	}
+
+	return -1;
+}
+
+static int _fibres_in_my_thread() {
+
+	master_thread_t * m = pthread_getspecific(master_key);
+
+	return m->ref;
+}
+
+int ff_yield_to(ff_handle f) {
+
+	master_thread_t * m = pthread_getspecific(master_key);
+
+	ff_handle me = m->running;
+
+	if(me == f)
+		return 0; // yield to self.
+
+	if( f && ( f->master != m ) )
+		return -1; // cannot migrate fibres
+
+	if(_fibres_in_my_thread() <= 1)
+		return -1; // nothing to yield to!
+
+	m->next = f;
+
+	pthread_mutex_unlock(&m->mutex);
+	pthread_cond_broadcast(&m->condition);
+	_wait_for_runnable(me);
+
+	return 0;
+}
+
+int ff_yield() {
+
+	master_thread_t * m = pthread_getspecific(master_key);
+
+	ff_handle me = m->running;
+
+	if(_fibres_in_my_thread() <= 1)
+		return 0; // nothing to yield to!
+
+	m->next = NULL;
+
+	pthread_mutex_unlock(&m->mutex);
+	pthread_cond_broadcast(&m->condition);
+	_wait_for_runnable(me);
+}
+
+int ff_set_exit_to(ff_handle h) {
+
+	int err = 0;
+
+	master_thread_t * m = pthread_getspecific(master_key);
+
+	if(!h)
+		m->running->exit_to = NULL;
+	else if( h->master == m)
+		m->running->exit_to = h;
+	else {
+		err = -1;
+	}
+	return err;
+}
+
+static int _ff_exit_to(ff_handle h) {
+
+	int err = 0;
+
+	master_thread_t * m = pthread_getspecific(master_key);
+
+	if( h && (h->master == m) )
+		m->next = h;
+	else {
+		m->next = NULL;
+		if(h)
+			err = -1;
+	}
+
+	m->running = NULL;
+	pthread_mutex_unlock(&m->mutex);
+	pthread_cond_broadcast(&m->condition);
+
+	_free_master_struct(m);
+
+	pthread_exit(NULL);
+	return err;
+}
+
+int ff_exit() {
+
+	master_thread_t * m = pthread_getspecific(master_key);
+
+	return _ff_exit_to(m->running->exit_to);
+}
+
