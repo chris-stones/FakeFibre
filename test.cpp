@@ -16,7 +16,7 @@ void * ff1(void * data) {
 	int i = 0;
 	int n = 0;
 	const char * s[] = {"A","B","C","\n"};
-	for(n=0;n<2;n++) {
+	for(n=0;n<4;n++) {
 		for(i=0;i<4;i++)
 			printf("%s", s[i]);
 
@@ -34,7 +34,7 @@ void * ff2(void * data) {
 	int i = 0;
 	int n = 0;
 	const char * s[] = {"1","2","3","\n"};
-	for(n=0;n<2;n++) {
+	for(n=0;n<4;n++) {
 		for(i=0;i<4;i++)
 			printf("%s", s[i]);
 

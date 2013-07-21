@@ -9,6 +9,11 @@
  * libconcurrency - would be perfect.... except it reallocates / moves stacks... cant take the address of stack variables! I need this. )
  **/
 
+/*
+ * TODO: use a per-fibre condition variable instead of one global for performance...
+ * 	will need to re-think the yield-to-any / exit to any functionality
+ */
+
 #include "FakeFibre.h"
 
 #include<pthread.h>
@@ -105,9 +110,7 @@ static void _wait_for_runnable(ff_handle h) {
 
 		pthread_cond_wait( &h->master->condition, &h->master->mutex );
 
-		if(h->master->next && ( h->master->next != h) )
-			pthread_mutex_unlock(&h->master->mutex);
-		else
+		if(!h->master->next || ( h->master->next == h) )
 			break;
 	}
 
@@ -206,7 +209,6 @@ int ff_yield_to(ff_handle f) {
 
 	m->next = f;
 
-	pthread_mutex_unlock(&m->mutex);
 	pthread_cond_broadcast(&m->condition);
 	_wait_for_runnable(me);
 
@@ -224,7 +226,6 @@ int ff_yield() {
 
 	m->next = NULL;
 
-	pthread_mutex_unlock(&m->mutex);
 	pthread_cond_broadcast(&m->condition);
 	_wait_for_runnable(me);
 }
