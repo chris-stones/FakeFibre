@@ -24,6 +24,7 @@ int ff_create(ff_handle * f, ff_function start_routine, void * data, ff_handle e
 int ff_yield_to(ff_handle f);
 int ff_yield();
 int ff_set_exit_to(ff_handle f);
+int ff_kill(ff_handle f);
 int ff_exit();
 
 #ifdef __cplusplus

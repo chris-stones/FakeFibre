@@ -18,6 +18,7 @@
 
 #include<pthread.h>
 #include<stdlib.h>
+#include<stdio.h>
 
 /*** TLS ***/
 static pthread_key_t master_key;
@@ -40,6 +41,8 @@ struct _fake_fibre {
 	void *data;
 
 	ff_handle exit_to;
+
+	int kill_flag;
 };
 
 struct master_thread_struct {
@@ -110,6 +113,10 @@ static void _wait_for_runnable(ff_handle h) {
 
 	h->master->running = h;
 	h->master->next = h;
+
+	if(h->kill_flag)
+		ff_exit();
+		
 }
 
 static void * _new_fake_fibre(void* data) {
@@ -270,4 +277,40 @@ int ff_exit() {
 
 	return _ff_exit_to(m->running->exit_to);
 }
+
+int ff_kill(ff_handle f) {
+
+	if(f)  {
+
+		master_thread_t * m = pthread_getspecific(master_key);
+
+		if(f->master->running == f) {
+			// suicide... ERROR! use ff_exit() to end callers fibre.
+			// caller wont be expecting its 'exit_to' fibre to be woken by this function.
+			return -1;
+		}
+		else if(f->master != m) {
+			
+			// cant migrate fibres between threads.
+			//  in other words.. fibres can only kill other fibers in its own thread... sisters!
+			return -1;
+		}
+		else {
+			// murder... 
+			// NOTE that pthread_cancel is optional... and not implemented on some platforms ( ANDROID! ).
+			// so, for portability sake, just set a kill flag.
+			f->kill_flag = 1; 
+
+			// We are about to wake 'f' so it can kill itself...
+			//  caller will not expect a different fiber to wake,
+			//  so make sure this is the next fibre to run!
+			f->exit_to = f->master->running;
+
+			// wake 'f' so it can kill itself.
+			return ff_yield_to(f);
+		}
+	}
+	return -1;
+}
+
 
