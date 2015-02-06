@@ -78,7 +78,7 @@ static int _free_master_struct(master_thread_t * master) {
 
 	master->ref--;
 	if(master->ref>0)
-		return;
+		return 0;
 
 	pthread_setspecific(master_key, NULL);
 
@@ -95,12 +95,6 @@ static int _create_ff_struct(ff_handle * f) {
 		return -1;
 
 	*f = h;
-	return 0;
-}
-
-static int _free_ff_struct(ff_handle f) {
-
-	free(f);
 	return 0;
 }
 
@@ -127,6 +121,10 @@ static void * _new_fake_fibre(void* data) {
 	pthread_detach( pthread_self() );
 
 	pthread_setspecific(master_key, h->master);
+
+	pthread_mutex_lock(&h->master->mutex);
+
+	pthread_cond_broadcast(&h->master->condition);
 
 	_wait_for_runnable(h);
 
@@ -163,6 +161,7 @@ int ff_convert_this(ff_handle * f) {
 
 		return 0;
 	}
+	return -1;
 }
 
 int ff_create(ff_handle * _f, ff_function start_routine, void * data, ff_handle exit_to) {
@@ -178,6 +177,10 @@ int ff_create(ff_handle * _f, ff_function start_routine, void * data, ff_handle 
 		f->master->ref++;
 
 		pthread_create( &f->thread, NULL, &_new_fake_fibre, f );
+
+		// WAIT for spawned fabe fibre to sleep in _wait_for_runnable() before returning.
+		//  Otherwise, a subsequent yield will broadcast without any wakable fibres.
+		pthread_cond_wait( &f->master->condition, &f->master->mutex );
 
 		return 0;
 	}
@@ -217,17 +220,7 @@ int ff_yield_to(ff_handle f) {
 
 int ff_yield() {
 
-	master_thread_t * m = pthread_getspecific(master_key);
-
-	ff_handle me = m->running;
-
-	if(_fibres_in_my_thread() <= 1)
-		return 0; // nothing to yield to!
-
-	m->next = NULL;
-
-	pthread_cond_broadcast(&m->condition);
-	_wait_for_runnable(me);
+	return ff_yield_to(NULL);
 }
 
 int ff_set_exit_to(ff_handle h) {
@@ -260,6 +253,7 @@ static int _ff_exit_to(ff_handle h) {
 			err = -1;
 	}
 
+	free(m->running);
 	m->running = NULL;
 	pthread_mutex_unlock(&m->mutex);
 	pthread_cond_broadcast(&m->condition);
