@@ -31,6 +31,14 @@ static void make_master_key() {
 struct master_thread_struct;
 typedef struct master_thread_struct master_thread_t;
 
+typedef enum ff_flags {
+
+	KILL_FLAG=(1<<0),
+	RUNNING_FLAG=(1<<1), // fibre HASNT exited yet.
+	AWAKE_FLAG=(1<<2),	 // fibre is awake.
+
+}ff_flags_t;
+
 struct _fake_fibre {
 
 	master_thread_t * master;
@@ -42,7 +50,7 @@ struct _fake_fibre {
 
 	ff_handle exit_to;
 
-	int kill_flag;
+	int flags;
 };
 
 struct master_thread_struct {
@@ -103,6 +111,8 @@ static int _create_ff_struct(ff_handle * f) {
 
 static void _wait_for_runnable(ff_handle h) {
 
+	h->flags &= ~AWAKE_FLAG;
+
 	for(;;) {
 
 		pthread_cond_wait( &h->master->condition, &h->master->mutex );
@@ -111,10 +121,12 @@ static void _wait_for_runnable(ff_handle h) {
 			break;
 	}
 
+	h->flags |= AWAKE_FLAG;
+
 	h->master->running = h;
 	h->master->next = h;
 
-	if(h->kill_flag)
+	if(h->flags & KILL_FLAG)
 		ff_exit();
 		
 }
@@ -132,6 +144,8 @@ static void * _new_fake_fibre(void* data) {
 	pthread_mutex_lock(&h->master->mutex);
 
 	pthread_cond_broadcast(&h->master->condition);
+
+	h->flags |= RUNNING_FLAG;
 
 	_wait_for_runnable(h);
 
@@ -185,7 +199,7 @@ int ff_create(ff_handle * _f, ff_function start_routine, void * data, ff_handle 
 
 		pthread_create( &f->thread, NULL, &_new_fake_fibre, f );
 
-		// WAIT for spawned fabe fibre to sleep in _wait_for_runnable() before returning.
+		// WAIT for spawned fake fibre to sleep in _wait_for_runnable() before returning.
 		//  Otherwise, a subsequent yield will broadcast without any wakable fibres.
 		pthread_cond_wait( &f->master->condition, &f->master->mutex );
 
@@ -216,6 +230,9 @@ int ff_yield_to(ff_handle f) {
 
 	if(_fibres_in_my_thread() <= 1)
 		return -1; // nothing to yield to!
+
+	if(f && (f->flags & RUNNING_FLAG) == 0)
+		return 0; // yield-to fibre is no-longer running. nothing to yield to. should this be an error?
 
 	m->next = f;
 
@@ -260,7 +277,18 @@ static int _ff_exit_to(ff_handle h) {
 			err = -1;
 	}
 
-	free(m->running);
+	if(m->next && ff_is_running(m->next)<1) {
+
+		// exiting to a fibre that is no-longer running!?
+		// OPTION1: do it anyway... deadlock other fibres in this master thread!
+		// OPTION2: exit to any other fibre.
+
+		// I think option 2 is best!?
+		m->next = NULL;
+	}
+
+	m->running->flags &= ~(RUNNING_FLAG | AWAKE_FLAG);
+
 	m->running = NULL;
 	pthread_mutex_unlock(&m->mutex);
 	pthread_cond_broadcast(&m->condition);
@@ -291,7 +319,7 @@ int ff_kill(ff_handle f) {
 		}
 		else if(f->master != m) {
 			
-			// cant migrate fibres between threads.
+			// can't migrate fibres between threads.
 			//  in other words.. fibres can only kill other fibers in its own thread... sisters!
 			return -1;
 		}
@@ -299,7 +327,7 @@ int ff_kill(ff_handle f) {
 			// murder... 
 			// NOTE that pthread_cancel is optional... and not implemented on some platforms ( ANDROID! ).
 			// so, for portability sake, just set a kill flag.
-			f->kill_flag = 1; 
+			f->flags |= KILL_FLAG;
 
 			// We are about to wake 'f' so it can kill itself...
 			//  caller will not expect a different fiber to wake,
@@ -313,4 +341,40 @@ int ff_kill(ff_handle f) {
 	return -1;
 }
 
+int ff_is_running(ff_handle f) {
+
+	if(f)
+		return !!(f->flags & RUNNING_FLAG);
+
+	return 0;
+}
+
+int ff_wait(ff_handle f) {
+
+	master_thread_t * m = pthread_getspecific(master_key);
+
+	if(f->master != m)
+		return -1; // this fibre belongs to a different thread!
+
+	while( f->flags & RUNNING_FLAG )
+		ff_yield_to(f);
+
+	return 0;
+}
+
+int ff_free(ff_handle f) {
+
+	if(f) {
+		master_thread_t * m = pthread_getspecific(master_key);
+
+		if(f->master != m)
+				return -1; // this fibre belongs to a different thread!
+
+		if(f->flags & RUNNING_FLAG)
+			return -1; // can't free a running fibre!
+
+		free(f);
+	}
+	return 0;
+}
 
